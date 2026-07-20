@@ -1,0 +1,47 @@
+{
+  "name": "@estebanforge/pi-token-cost-ledger",
+  "version": "1.0.0",
+  "description": "Token & cost ledger for Pi. Captures every assistant message to a per-day JSONL ledger and exposes a /usage command with by-model, by-period breakdowns (today/day/week/month/year/all) showing both real USD and API-equivalent USD.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "cost-tracking",
+    "token-usage",
+    "usage",
+    "analytics",
+    "llm-cost"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "EstebanForge",
+    "email": "esteban@actitude.cl",
+    "url": "https://actitud.xyz"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EstebanForge/pi-token-cost-ledger.git"
+  },
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}

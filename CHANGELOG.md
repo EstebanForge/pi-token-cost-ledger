@@ -1,0 +1,86 @@
+# Changelog
+
+## 1.0.0 — 2026-07-22
+
+Initial release. One extension replaces the former 3-part token-cost setup
+(`@ctogg/pi-cost-counter` + `api-equiv.sh` + `tokens.zsh` + `monthly-rollup.sh`).
+Owns the full lifecycle: capture every assistant message to a JSONL ledger, then
+query it with a `/usage` command across day/week/month/year/all/model dimensions,
+showing both real USD (provider cost) and API-equivalent USD (recomputed from a
+bundled price file, since on a flat plan the marginal cost is `$0` and only the
+API-equiv axis is comparable across vendors).
+
+### Added
+- **Capture.** A `message_end` hook appends `{ts, provider, model, tokens, cost}`
+  to a per-day JSONL ledger at `~/.pi/extensions-data/<author>/<extension>/YYYY/MM/DD.jsonl`.
+  Record format is byte-compatible with the legacy `@ctogg` ledger, so ~20 prior
+  files are valid day one with zero migration.
+- **`/usage` command.** Periods: `today` | `day [YYYY-MM-DD]` | `week [N]` |
+  `month [YYYY-MM]` | `year [YYYY]` | `all` | `model <name>`. Each report prints
+  grand totals (calls, tokens in/out/cache/total, real $ + api-equiv $), a
+  by-model breakdown, and by-day or by-month subtotals when the window spans
+  more than one period. Case-insensitive model match with known-models hint on
+  miss.
+- **Two cost figures.** Real USD comes straight from the provider's `cost.total`;
+  api-equiv USD is computed at query time from current prices (reprice semantics
+  — history always reflects the latest price file, never a stale snapshot).
+- **Bundled `prices.json`** with canonical first-party rates (GLM, Claude,
+  Gemini, GPT, Grok, DeepSeek, MiniMax, MiMo) sourced from [models.dev](https://models.dev).
+  Override at `<ledger>/prices.json` takes precedence; both are re-read each call,
+  so edits take effect immediately (no reload).
+- **Unpriced-model warning.** Records whose model has no price entry (experiment
+  aliases, unknown providers) are tracked and surfaced as a `⚠ N calls had no
+  price entry — shown as $0,00` line instead of silently folding into the total.
+- **Case-insensitive price lookup.** Ledger model strings (mixed case, e.g.
+  `MiniMax-M3`) match canonical lowercase price keys via a `PriceIndex` built
+  once per query, so casing drift never reports phantom `$0,00`.
+- **Multi-root ledger.** Reads `<ledger>/roots.conf` (one path/line, `#` comments,
+  first = primary write target). Disjoint ledgers are unioned read-only; no dedup.
+  Honors `PI_COST_LEDGER` / `PI_COST_LEDGERS` env overrides.
+- **Construct-cli sandbox aggregation.** Auto-detects the sandbox ledger under
+  `~/.config/construct-cli/home/...` when running on the host, so `/usage`
+  shows unified host + sandbox spend. Host-only by construction: inside the
+  sandbox, `homedir()` is the overlay root, so the union is disabled (no phantom
+  nested path, no double-count).
+- **Locale-aware number formatting.** `/usage` reports respect the terminal's locale: group/decimal separators are detected from `LC_ALL` > `LC_NUMERIC` > `LANG` (POSIX precedence) via `Intl.NumberFormat.formatToParts`. Override with the `token-cost-ledger-numbers` flag or `TOKEN_COST_LEDGER_NUMBERS` env (`auto` default | `comma` for `1.148,23` | `dot` for `1,148.23`). Default `auto` means each user sees their own convention without configuration.
+- **`/token-cost-ledger` command.** Options status panel by default; `/token-cost-ledger <auto|comma|dot>` (or `set <value>`) changes the number format via `pi config set` + reload. Tab-completion for the three values. Mirrors the `/glm-tweaks` pattern.
+- **`CACHE_CONV`** env (`separate` default | `included`) controls whether
+  `cacheRead` is treated as a subset of input or as part of the full prompt;
+  surfaced in the report header.
+
+### Design
+- **Storage convention.** Introduces a GitHub-scoped layout for extension data:
+  `~/.pi/extensions-data/<author>/<extension>/`. No pi standard existed (surveyed
+  `getAgentDir()`-based and ad-hoc paths across installed extensions); this
+  convention is collision-proof, self-documenting, and derives from pi's
+  `getAgentDir()` so it inherits `PI_CODING_AGENT_DIR` overrides.
+- **Soft-fail read paths.** Per-file JSONL reads stream line-by-line and swallow
+  malformed lines, unreadable files, and mid-read failures (rotated/permission-
+  flipped). A single bad file never crashes `/usage`. Records are shape-guarded
+  (`isCostRecord`: `ts` is number, `tokens` is object) so legacy or partial
+  records skip cleanly rather than blowing up aggregation.
+- **Best-effort capture.** The `message_end` hook wraps all filesystem work in
+  try/catch — a logging side-channel must never break the chat session. Disk
+  full / permission errors are swallowed and logged to stderr.
+- **Numeric coercion at capture.** Provider usage fields are coerced to number
+  before write, so a provider returning a string field can't corrupt downstream
+  sums via string concatenation.
+- **`/usage all` walks the directory.** Uses `readAllRecords` (directory walk
+  touching only existing files) instead of materializing a multi-year date range.
+  No hardcoded floor year.
+
+### Notes
+- **Migration from the old setup.** Uninstall `@ctogg/pi-cost-counter`
+  (`pi uninstall npm:@ctogg/pi-cost-counter`); the old `api-equiv.sh`,
+  `monthly-rollup.sh`, `tokens.zsh`, and `install.sh` can be deleted. Historical
+  JSONL files are read in place — no data migration, no re-import. Legacy
+  `monthly/*.json` rollups are ignored (the extension reads raw JSONL directly).
+- **Parity verified** against the old `api-equiv.sh --by-month` TOTAL row on
+  cutover: api-equiv USD matched to the cent ($1.148,23); real USD ($70,53) is
+  newly visible (the old scripts discarded `cost.total`).
+- **Tier-priced models** (Gemini Pro, GPT-5.5/5.6, MiniMax-M3 over 200K/272K/512K
+  context) use the default tier in `prices.json`; the over-tier rate is noted in
+  `_tier_note` for manual reference.
+- **Refresh prices** with the documented `curl` + `jq` recipe (see README
+  "Updating prices") against `https://models.dev/catalog.json`. Keys must match
+  the ledger's model string; case is normalized automatically.
