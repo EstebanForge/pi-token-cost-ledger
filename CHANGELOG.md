@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.1 — 2026-07-21
+
+### Fixed
+- **Setting the number format no longer crashes.** `/token-cost-ledger <auto|comma|dot>`
+  and the menu's apply path tried to persist via `pi config set`, which is not a
+  real command (`pi config` only accepts `-l/--approve/--no-approve`; any
+  positional arg throws "Unexpected argument set" and exits 1). Selecting a
+  separator failed with `Failed to apply: token-cost-ledger-numbers (Unexpected
+  argument set)`.
+  - The chosen style now persists to a file-backed store (`settings.json` next
+    to `prices.json` in the ledger data dir), seeded into `registerFlag` at load.
+    `pi config set` is gone; setting calls `saveNumberStyleSetting` then
+    `/reload` (the reload re-seeds the flag from disk).
+  - The setting now survives a full pi restart too — the old mechanism never
+    persisted at all (extension flags are in-memory only; there is no CLI for
+    them).
+
 ## 1.1.0 — 2026-07-21
 
 ### Added

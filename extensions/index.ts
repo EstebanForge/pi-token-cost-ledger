@@ -43,7 +43,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, SettingsList, Text, type SelectItem, type SettingItem } from "@earendil-works/pi-tui";
 import { appendFile, mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -407,6 +407,43 @@ function loadRoots(): { roots: string[]; primary: string } {
 	// Default: base dir + construct sandbox (auto-detected, soft-fail if absent).
 	const roots = existsSync(CONSTRUCT_LEDGER) ? [baseDir, CONSTRUCT_LEDGER] : [baseDir];
 	return { roots, primary: baseDir };
+}
+
+// ── Number-style persistence (settings.json in the primary ledger root) ───────
+// pi has no built-in disk store for extension flags, and `pi config set` is
+// not a real command (only `-l/--approve/--no-approve`). So the chosen number
+// style persists in our own settings.json next to prices.json — same dir, same
+// pattern. Loaded at factory time to seed registerFlag's default; written on
+// every set. Env TOKEN_COST_LEDGER_NUMBERS still overrides per-session.
+const NUMBER_STYLES_ALL = ["auto", "comma", "dot"] as const;
+type NumberStylePref = (typeof NUMBER_STYLES_ALL)[number];
+const SETTINGS_FILE = "settings.json";
+
+function isNumberStyle(v: unknown): v is NumberStylePref {
+	return typeof v === "string" && (NUMBER_STYLES_ALL as readonly string[]).includes(v);
+}
+
+/** Read persisted number style. Missing/corrupt file → "auto". */
+function loadNumberStyleSetting(): NumberStylePref {
+	try {
+		const raw = readFileSync(join(loadRoots().primary, SETTINGS_FILE), "utf8");
+		const parsed = JSON.parse(raw) as { numbers?: unknown };
+		return isNumberStyle(parsed.numbers) ? parsed.numbers : "auto";
+	} catch {
+		return "auto";
+	}
+}
+
+/** Persist number style atomically (mkdir + writeFileSync into primary root). */
+function saveNumberStyleSetting(value: NumberStylePref): void {
+	const dir = loadRoots().primary;
+	try {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, SETTINGS_FILE), JSON.stringify({ numbers: value }, null, 2) + "\n", "utf8");
+	} catch {
+		// Non-fatal: the subsequent ctx.reload() re-seeds the flag from disk
+		// (registerFlag default), so the value still applies this session.
+	}
 }
 
 /** Cache convention, same knob as the old scripts. Default separate. */
@@ -843,12 +880,15 @@ function renderModel(theme: Theme, modelName: string, records: CostRecord[], idx
 export default function (pi: ExtensionAPI) {
 	// Register the number-style flag at factory load time. registerFlag is static
 	// setup; calling it per session would clobber user preferences on every /new
-	// or /reload. Values: "auto" (default) | "comma" | "dot".
+	// or /reload. Default is seeded from the persisted settings.json so the
+	// choice survives pi restarts; CLI --flag and env TOKEN_COST_LEDGER_NUMBERS
+	// still override per-invocation / per-session. Values: "auto" | "comma" | "dot".
+	const persistedStyle = loadNumberStyleSetting();
 	pi.registerFlag("token-cost-ledger-numbers", {
 		description:
 			"Number format for /token-usage reports: \"auto\" (detect from terminal locale, default) | \"comma\" (1.148,23) | \"dot\" (1,148.23).",
 		type: "string",
-		default: "auto",
+		default: persistedStyle,
 	});
 
 	// ── OPTIONS: /token-cost-ledger — interactive menu (sets the number-style flag) ─
@@ -865,7 +905,7 @@ export default function (pi: ExtensionAPI) {
 		dot: "1,148.23",
 	};
 
-	// The flag value `pi config set` controls — NOT the env-overridden
+	// The flag value this extension controls — NOT the env-overridden
 	// effective value (that's numberStyleSetting). The menu reads/writes the
 	// flag; env (TOKEN_COST_LEDGER_NUMBERS) is a separate per-session override
 	// the menu can't touch, surfaced in the header when it's masking the flag.
@@ -885,8 +925,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			"",
 			"  set:    /token-cost-ledger <auto|comma|dot>",
-			"  also:   pi config set token-cost-ledger-numbers <value>",
-			"  env:    TOKEN_COST_LEDGER_NUMBERS=<value> (per-session)",
+			"  env:    TOKEN_COST_LEDGER_NUMBERS=<value> (per-session override)",
 			"",
 			"  refresh: /token-cost-ledger refresh  (pull latest costs from models.dev)",
 		];
@@ -973,7 +1012,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Direct set: `/token-cost-ledger <value>` or `/token-cost-ledger set <value>`.
-			// One-shot persist via `pi config set` then reload — shorthand for users
+			// One-shot persist (settings.json) then reload — shorthand for users
 			// who know what they want. Bare `set` (no value) falls through to menu.
 			if (trimmed !== "" && trimmed !== "status" && trimmed !== "set") {
 				const tokens = trimmed.split(/\s+/).filter(Boolean);
@@ -985,14 +1024,7 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
-				const result = await pi.exec("pi", ["config", "set", "token-cost-ledger-numbers", value]);
-				if (result.code !== 0) {
-					ctx.ui.notify(
-						`Failed to set token-cost-ledger-numbers: ${result.stderr.trim() || `exit ${result.code}`}`,
-						"error",
-					);
-					return;
-				}
+				saveNumberStyleSetting(value);
 				ctx.ui.notify(`token-cost-ledger-numbers: ${flagNumberStyle()} → ${value}. Reloading...`, "info");
 				warnIfEnvMasked(ctx);
 				await ctx.reload();
@@ -1071,7 +1103,7 @@ export default function (pi: ExtensionAPI) {
 			// trigger, and we haven't called it yet).
 			//
 			// Two independent intents may be staged: a number-format change (needs
-			// `pi config set` + reload) and a refresh (writes prices.json, no reload).
+			// settings.json + reload) and a refresh (writes prices.json, no reload).
 			// Run refresh first so its notify lands before any reload; apply the
 			// flag change last because reload ends this ctx.
 			const refreshWanted = pending.get("refresh-prices") === "yes";
@@ -1089,14 +1121,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (!numChanged) return;
 
-			const r = await pi.exec("pi", ["config", "set", "token-cost-ledger-numbers", numValue]);
-			if (r.code !== 0) {
-				ctx.ui.notify(
-					`Failed to apply: token-cost-ledger-numbers (${r.stderr.trim() || `exit ${r.code}`})`,
-					"error",
-				);
-				return;
-			}
+			// pending values come from the SettingsList row (NUMBER_STYLES), so any
+			// non-empty value here is a valid style; narrow for the typed helper.
+			if (!isNumberStyle(numValue)) return;
+			saveNumberStyleSetting(numValue);
 			ctx.ui.notify(`token-cost-ledger-numbers: ${flagVal} → ${numValue}. Reloading...`, "info");
 			warnIfEnvMasked(ctx);
 			await ctx.reload();
