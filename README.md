@@ -1,6 +1,6 @@
 # @estebanforge/pi-token-cost-ledger
 
-Token & cost ledger for [Pi](https://github.com/earendil-works/pi-coding-agent). Captures every assistant message to a per-day JSONL ledger and exposes a `/usage` command with by-model and by-period breakdowns showing **both** real USD and API-equivalent USD.
+Token & cost ledger for [Pi](https://github.com/earendil-works/pi-coding-agent). Captures every assistant message to a per-day JSONL ledger and exposes a `/token-usage` command with by-model and by-period breakdowns showing **both** real USD and API-equivalent USD.
 
 ## Why two dollar figures
 
@@ -15,15 +15,19 @@ pi install npm:@estebanforge/pi-token-cost-ledger
 ## Usage
 
 ```
-/usage                         today (default)
-/usage today
-/usage day [YYYY-MM-DD]        today, or a specific day
-/usage week [N]                current ISO week; N = weeks ago
-/usage month [YYYY-MM]         current month, or a specific one
-/usage year [YYYY]             current year, or a specific one
-/usage all                     full history
-/usage model <name>            one model across all history, by month
+/token-usage                   opens a range menu (bare, in TUI)
+/token-usage today
+/token-usage day [YYYY-MM-DD]      today, or a specific day
+/token-usage week [N]              current ISO week; N = weeks ago
+/token-usage days [N]              rolling N-day window incl. today (default 30)
+/token-usage month [YYYY-MM]       current month, or a specific one
+/token-usage year [YYYY]           current year, or a specific one
+/token-usage all                   full history
+/token-usage model <name>          one model across all history, by month
 ```
+
+Run `/token-usage` with no argument (in the TUI) to pick a range from a menu:
+**Today · Last 7 days · This month · Last 30 days · This year · Last 365 days · All**. Arrow keys to move, Enter to select, Esc to cancel. In headless/RPC mode, bare `/token-usage` still defaults to today. Each menu item maps to the typed form shown above, so the menu doubles as a cheat sheet.
 
 Each report prints:
 
@@ -42,19 +46,31 @@ Each report prints:
   - `comma` — Latin/European: `1.148,23` (dot thousands, comma decimal)
   - `dot` — Anglo: `1,148.23` (comma thousands, dot decimal)
 
-  Set with `/token-cost-ledger comma` (in pi), `pi config set token-cost-ledger-numbers comma`, or per-session with `TOKEN_COST_LEDGER_NUMBERS=comma pi`. Run `/token-cost-ledger` bare to see current status.
+  Set with `/token-cost-ledger` (opens an interactive menu — cycle with Enter/Space, persists on close), `/token-cost-ledger comma` (one-shot shorthand), `pi config set token-cost-ledger-numbers comma`, or per-session with `TOKEN_COST_LEDGER_NUMBERS=comma pi`.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
-| `/usage [period]` | Query usage (today/day/week/month/year/all/model). See Usage above. |
-| `/token-cost-ledger` | Show options status panel. |
-| `/token-cost-ledger <auto\|comma\|dot>` | Set number format (persists + reloads). |
+| `/token-usage` | Open the range menu (Today / Last 7-30-365 days / This month / This year / All). |
+| `/token-usage <period>` | Query usage directly (today/day/week/days/month/year/all/model). See Usage above. |
+| `/token-cost-ledger refresh` | Pull latest costs from models.dev into the override (network). |
+| `/token-cost-ledger` | Open the interactive options menu (number format / refresh prices). |
+| `/token-cost-ledger <auto\|comma\|dot>` | Set number format directly (one-shot shorthand; persists + reloads). |
 
 ## Updating prices
 
-The bundled `extensions/prices.json` holds canonical **first-party** rates per 1M tokens (input / cache-read / output), keyed by the exact model string pi logs. Source: [**models.dev**](https://models.dev) — an open-source database of AI model specs and pricing. Refresh from its catalog:
+The bundled `extensions/prices.json` holds canonical **first-party** rates per 1M tokens (input / cache-read / output), keyed by the exact model string pi logs. Source: [**models.dev**](https://models.dev) — an open-source database of AI model specs and pricing.
+
+### Refresh from models.dev (in pi)
+
+Run `/token-cost-ledger refresh` (or open `/token-cost-ledger` and set **Refresh prices now → yes**) to pull the live [models.dev](https://models.dev/catalog.json) catalog and update the override file at `~/.pi/extensions-data/estebanforge/pi-token-cost-ledger/prices.json`. Load precedence means the next `/token-usage` reflects it immediately — no reload.
+
+The refresh is **update-only**: it refreshes costs for models already tracked, and preserves meta keys, hand-curated extras (e.g. grok / deepseek / mimo from non-first-party providers), and per-model `_tier_note` annotations. It does **not** add new models — those arrive via bundled-file releases. A network failure changes nothing.
+
+### Manual edit / regenerate
+
+To regenerate from scratch or add models, extract from the catalog with jq:
 
 ```bash
 curl -sL https://models.dev/catalog.json -o /tmp/models-dev-catalog.json

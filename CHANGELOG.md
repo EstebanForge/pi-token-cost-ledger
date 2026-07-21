@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.1.0 — 2026-07-21
+
+### Added
+- **Price refresh from models.dev.** `/token-cost-ledger refresh` (or the
+  **Refresh prices now** row in the `/token-cost-ledger` menu) pulls the live
+  [models.dev](https://models.dev/catalog.json) catalog and updates the
+  override `prices.json`. Update-only for tracked models; preserves meta keys,
+  hand-curated extras, and `_tier_note` annotations. Atomic write; a network
+  failure changes nothing. Load precedence means the next `/token-usage`
+  reflects it immediately (no reload).
+- **Quick-range menu for `/token-usage`.** Bare `/token-usage` (no args, in the
+  TUI) now opens an interactive picker: Today, Last 7 days, This month, Last
+  30 days, This year, Last 365 days, All. Arrow keys + Enter; Esc cancels.
+  Typed periods still work as before; headless/RPC mode still defaults to today.
+- **`days [N]` period.** Rolling N-day window ending today (inclusive), e.g.
+  `/token-usage days 7`. Subtotals switch to per-month once N > 31 to avoid
+  screen overflow.
+
+### Changed
+- **Breaking: `/usage` renamed to `/token-usage`.** No alias. The old command
+  name is gone. Update any muscle memory, scripts, or docs that call `/usage`.
+- **`/token-cost-ledger` bare command now opens an interactive menu.** In the
+  TUI it cycles number format (auto/comma/dot) and offers a refresh-prices
+  row via Enter/Space; the old read-only status panel survives only as the
+  headless/RPC fallback. Typed shorthand (`/token-cost-ledger comma`) is
+  unchanged.
+- **`/token-usage days [N]` rejects N > 3650.** Sanity cap on the typed path
+  (~10 years); the menu uses fixed 7/30/365, so this only guards against
+  typos like `days 999999` probing a file per day.
+
 ## 1.0.0 — 2026-07-22
 
 Initial release. One extension replaces the former 3-part token-cost setup

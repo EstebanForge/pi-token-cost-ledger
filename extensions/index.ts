@@ -8,7 +8,7 @@
  *      per assistant message to ~/.pi/extensions-data/estebanforge/pi-token-cost-ledger/YYYY/MM/DD.jsonl.
  *      Format is byte-compatible with the existing ledger, so ~20 prior
  *      files are valid day one (zero migration).
- *   2. QUERY   — /usage command. Periods: today | day | week | month |
+ *   2. QUERY   — /token-usage command. Periods: today | day | week | month |
  *      year | all, plus `model <name>`. Shows BOTH real USD (from the
  *      provider's own cost) AND api-equivalent USD (what the same tokens
  *      cost pay-as-you-go on GLM), because on a flat plan the marginal
@@ -17,7 +17,12 @@
  * Prices are query-time computed (reprice semantics): history always
  * reflects the current prices.json, never a stale snapshot. The default
  * prices ship as a sibling asset; ~/.pi/extensions-data/estebanforge/pi-token-cost-ledger/prices.json overrides
- * if present (preserves the single-file-edit convention).
+ * if present (preserves the single-file-edit convention). Run
+ * `/token-cost-ledger refresh` to regenerate that override from the live
+ * models.dev catalog (updates tracked models' costs; preserves extras).
+ *   3. REFRESH — /token-cost-ledger [refresh]. Pulls https://models.dev/catalog.json,
+ *      updates the override prices.json in place (atomic). Update-only for
+ *      tracked models; meta + hand-curated extras + _tier_note preserved.
  *
  * Multi-root: reads ~/.pi/extensions-data/estebanforge/pi-token-cost-ledger/roots.conf (one path/line, # comments,
  * first = primary write target). Construct sandbox and any other producers
@@ -28,10 +33,17 @@
  *    tokens:{input,output,cacheRead,cacheWrite},
  *    cost:{input,output,cacheRead,cacheWrite,total}}
  */
-import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { appendFile, mkdir, readdir, stat } from "node:fs/promises";
-import { createReadStream, existsSync, readFileSync } from "node:fs";
+import {
+	getAgentDir,
+	getSelectListTheme,
+	getSettingsListTheme,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
+import { Container, SelectList, SettingsList, Text, type SelectItem, type SettingItem } from "@earendil-works/pi-tui";
+import { appendFile, mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -88,6 +100,7 @@ interface PriceTier {
 	i: number; // input per 1M
 	c: number; // cache-read per 1M
 	o: number; // output per 1M
+	_tier_note?: string; // optional manual annotation (higher-tier pricing, etc.)
 }
 
 type Prices = Record<string, PriceTier>;
@@ -222,6 +235,148 @@ function loadPrices(baseDir: string): Prices {
 		// fall through to bundled
 	}
 	return loadBundledPrices();
+}
+
+// ── Refresh: pull live costs from models.dev into the override file ──────────
+
+// The catalog URL and the first-party provider scope. Mirrors the `_doc` /
+// `_refresh` meta already in prices.json: only canonical first-party providers
+// (no resellers), so a refresh never replaces a real price with a routed one.
+const MODELS_DEV_URL = "https://models.dev/catalog.json";
+const FIRST_PARTY_PROVIDERS = ["zai", "anthropic", "minimax", "google", "openai"];
+
+// Catalog cost object shape (per 1M tokens, USD). models.dev returns null for
+// free / bundled-plan models; those are skipped (matches the `_refresh` jq
+// `select(.value.cost != null)`).
+interface CatalogCost {
+	input?: number;
+	output?: number;
+	cache_read?: number;
+	cache_write?: number;
+}
+
+/** Build model-key → cost from the first-party providers in the catalog. */
+function buildCatalogIndex(catalog: unknown): Map<string, CatalogCost> {
+	const idx = new Map<string, CatalogCost>();
+	const providers = (catalog as { providers?: Record<string, { models?: Record<string, { cost?: CatalogCost | null }> }> } | null)?.providers;
+	if (!providers) return idx;
+	for (const p of FIRST_PARTY_PROVIDERS) {
+		const models = providers[p]?.models;
+		if (!models) continue;
+		for (const [key, def] of Object.entries(models)) {
+			if (def?.cost) idx.set(key, def.cost);
+		}
+	}
+	return idx;
+}
+
+interface RefreshResult {
+	ok: true;
+	updated: string[]; // model keys whose price changed
+	unchanged: number; // tracked models found in catalog at the same price
+	missing: string[]; // tracked models the catalog no longer lists (left as-is)
+	wrote: string; // override path written
+}
+interface RefreshError {
+	ok: false;
+	error: string;
+}
+
+/**
+ * Pull live costs from models.dev and update the override prices.json.
+ *
+ * Semantic: UPDATE-ONLY for models already in the effective prices (override
+ * if present, else bundled). Does NOT add the 100+ catalog models the user
+ * doesn't track — refresh keeps the curated set stable and only refreshes
+ * prices, which is what "something changed" means in practice. New models
+ * arrive via bundled-file releases (the `_refresh` jq recipe), not here.
+ *
+ * Preserves: meta keys (`_doc`/`_refresh`/`_intro_pricing`), hand-curated
+ * extras from non-first-party providers (grok/deepseek/mimo), and per-model
+ * `_tier_note` annotations. On success writes `<baseDir>/prices.json`
+ * atomically (tmp + rename) so a crash mid-write can't corrupt it. On ANY
+ * fetch/parse failure, returns `{ok:false}` and leaves existing files untouched.
+ */
+async function refreshPrices(baseDir: string): Promise<RefreshResult | RefreshError> {
+	// Fetch with a hard timeout. A hung connection must never wedge the command.
+	let resp: Response;
+	try {
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), 15_000);
+		try {
+			resp = await fetch(MODELS_DEV_URL, { signal: ctrl.signal });
+		} finally {
+			clearTimeout(timer);
+		}
+	} catch (err) {
+		return { ok: false, error: `fetch failed: ${err instanceof Error ? err.message : String(err)}` };
+	}
+	if (!resp.ok) return { ok: false, error: `models.dev returned HTTP ${resp.status}` };
+
+	let catalog: unknown;
+	try {
+		catalog = await resp.json();
+	} catch (err) {
+		return { ok: false, error: `could not parse catalog JSON: ${err instanceof Error ? err.message : err}` };
+	}
+	const idx = buildCatalogIndex(catalog);
+	if (idx.size === 0) return { ok: false, error: "catalog parsed but listed no first-party models — schema changed?" };
+
+	// Output holds the file we'll write: meta strings (_doc/_refresh/etc.)
+	// + model tiers. Modeled as Record<string, unknown> because meta values
+	// are strings, not PriceTier — the `Prices` type's white lie only holds for
+	// model keys. Shallow copy is safe: we replace updated entries wholesale,
+	// never mutate entry fields, so the bundled cache stays pristine.
+	const effective = loadPrices(baseDir);
+	const out: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(effective)) out[k] = v;
+
+	const updated: string[] = [];
+	let unchanged = 0;
+	const missing: string[] = [];
+
+	for (const [key, raw] of Object.entries(effective)) {
+		if (key.startsWith("_")) continue; // meta — preserved as-is, untouched
+		const tier = raw as PriceTier;
+		const cost = idx.get(key);
+		if (!cost) {
+			missing.push(key); // not in first-party catalog (extra, or deprecated) — keep as-is
+			continue;
+		}
+		const next: PriceTier = {
+			i: typeof cost.input === "number" ? cost.input : tier.i,
+			c: typeof cost.cache_read === "number" ? cost.cache_read : tier.c,
+			o: typeof cost.output === "number" ? cost.output : tier.o,
+		};
+		if (tier._tier_note) next._tier_note = tier._tier_note; // preserve manual annotation
+		if (next.i !== tier.i || next.c !== tier.c || next.o !== tier.o) {
+			updated.push(key);
+			out[key] = next;
+		} else {
+			unchanged++;
+		}
+	}
+
+	// Stamp the fetch date into `_doc` so a later reader knows freshness.
+	// Keep the existing `_refresh` jq recipe + `_intro_pricing` verbatim.
+	const today = new Date().toISOString().slice(0, 10);
+	if (typeof out._doc === "string") {
+		out._doc = out._doc.replace(/Fetched \d{4}-\d{2}-\d{2}/, `Fetched ${today}`);
+	}
+
+	const target = join(baseDir, "prices.json");
+	const tmp = `${target}.tmp`;
+	try {
+		await mkdir(baseDir, { recursive: true });
+		await writeFile(tmp, JSON.stringify(out, null, 2) + "\n", "utf8");
+		await rename(tmp, target); // atomic on POSIX (same filesystem)
+	} catch (err) {
+		// Clean up the orphan tmp so a retry doesn't accumulate debris. Best-effort:
+		// if writeFile itself failed, tmp may not exist (ENOENT) — swallow that.
+		await unlink(tmp).catch(() => {});
+		return { ok: false, error: `write failed: ${err instanceof Error ? err.message : err}` };
+	}
+	return { ok: true, updated, unchanged, missing, wrote: target };
 }
 
 /**
@@ -535,6 +690,20 @@ function parseRange(args: string): Range | null {
 		// pretending to be "all history".
 		return { start: now, end: now, subtotalKey: "month", label: "all history" };
 	}
+	if (kind === "days") {
+		// Rolling N-day window ending today (inclusive). `week`/`month`/`year`
+		// are calendar-bound; `days` is the rolling-window counterpart the
+		// quick-range menu needs (last 7 / 30 / 365). Default 30 if bare.
+		// Subtotal by day for short spans, month once it would overflow a screen.
+		const n = parts[1] ? parseInt(parts[1], 10) : 30;
+		if (isNaN(n) || n < 1) return null;
+		if (n > 3650) return null; // sanity cap (~10y): typed path only; menu uses fixed 7/30/365
+		const end = now;
+		const start = new Date(now);
+		start.setDate(start.getDate() - (n - 1)); // include today
+		const subtotalKey = n > 31 ? "month" : "day";
+		return { start, end, subtotalKey, label: `last ${n} days (${dayKey(start)} → ${dayKey(end)})` };
+	}
 	return null;
 }
 
@@ -677,12 +846,17 @@ export default function (pi: ExtensionAPI) {
 	// or /reload. Values: "auto" (default) | "comma" | "dot".
 	pi.registerFlag("token-cost-ledger-numbers", {
 		description:
-			"Number format for /usage reports: \"auto\" (detect from terminal locale, default) | \"comma\" (1.148,23) | \"dot\" (1,148.23).",
+			"Number format for /token-usage reports: \"auto\" (detect from terminal locale, default) | \"comma\" (1.148,23) | \"dot\" (1,148.23).",
 		type: "string",
 		default: "auto",
 	});
 
-	// ── OPTIONS: /token-cost-ledger — status panel + set the number-style flag ───
+	// ── OPTIONS: /token-cost-ledger — interactive menu (sets the number-style flag) ─
+	// Mirrors pi-glm-tweaks's /glm-tweaks: bare command opens an interactive
+	// SettingsList the user cycles with Enter/Space (no typing required);
+	// `<value>` or `set <value>` is kept as a one-shot shorthand. Outside TUI
+	// (RPC/headless), falls back to the read-only status panel — custom
+	// components are terminal-only.
 	const NUMBER_STYLES = ["auto", "comma", "dot"] as const;
 	type NumberStyleName = (typeof NUMBER_STYLES)[number];
 	const STYLE_SAMPLES: Record<NumberStyleName, string> = {
@@ -690,6 +864,15 @@ export default function (pi: ExtensionAPI) {
 		comma: "1.148,23",
 		dot: "1,148.23",
 	};
+
+	// The flag value `pi config set` controls — NOT the env-overridden
+	// effective value (that's numberStyleSetting). The menu reads/writes the
+	// flag; env (TOKEN_COST_LEDGER_NUMBERS) is a separate per-session override
+	// the menu can't touch, surfaced in the header when it's masking the flag.
+	function flagNumberStyle(): NumberStyleName {
+		const v = (pi.getFlag("token-cost-ledger-numbers") as string | undefined)?.trim().toLowerCase();
+		return (NUMBER_STYLES as readonly string[]).includes(v ?? "") ? (v as NumberStyleName) : "auto";
+	}
 
 	function renderStatusPanel(): string {
 		const current = numberStyleSetting(pi);
@@ -704,13 +887,55 @@ export default function (pi: ExtensionAPI) {
 			"  set:    /token-cost-ledger <auto|comma|dot>",
 			"  also:   pi config set token-cost-ledger-numbers <value>",
 			"  env:    TOKEN_COST_LEDGER_NUMBERS=<value> (per-session)",
+			"",
+			"  refresh: /token-cost-ledger refresh  (pull latest costs from models.dev)",
 		];
 		return lines.join("\n");
 	}
 
+	/** Detect env TOKEN_COST_LEDGER_NUMBERS overriding the flag; true when set and differs. */
+	function envOverrideState(): { masked: boolean; envOverride: string | undefined } {
+		const envOverride = process.env.TOKEN_COST_LEDGER_NUMBERS?.trim().toLowerCase();
+		const masked =
+			(envOverride === "auto" || envOverride === "comma" || envOverride === "dot") &&
+			envOverride !== flagNumberStyle();
+		return { masked, envOverride };
+	}
+
+	/**
+	 * Warn (single shared notify) when env is masking the flag the user just
+	 * changed. Used by both the direct-set shorthand and the menu path so the
+	 * wording stays in one place. No-op when nothing is masked.
+	 */
+	function warnIfEnvMasked(ctx: ExtensionCommandContext): void {
+		const { masked, envOverride } = envOverrideState();
+		if (!masked || !envOverride) return;
+		ctx.ui.notify(
+			`Note: env TOKEN_COST_LEDGER_NUMBERS=${envOverride} is still overriding the flag this session.`,
+			"warning",
+		);
+	}
+
+	/** Last-refresh date for the menu row label, from the override file's mtime. */
+	function refreshLabel(baseDir: string): string {
+		try {
+			const st = statSync(join(baseDir, "prices.json"));
+			return `last ${st.mtime.toISOString().slice(0, 10)}`;
+		} catch {
+			return "never";
+		}
+	}
+
+	/** Human-readable summary of a refresh for the success notify. */
+	function formatRefreshResult(r: RefreshResult): string {
+		const parts = [`${r.updated.length} updated`, `${r.unchanged} unchanged`];
+		if (r.missing.length > 0) parts.push(`${r.missing.length} preserved`);
+		return `Refreshed prices from models.dev — ${parts.join(", ")}.`;
+	}
+
 	pi.registerCommand("token-cost-ledger", {
 		description:
-			"pi-token-cost-ledger options: show status, or set number format. Usage: /token-cost-ledger [auto|comma|dot]",
+			"pi-token-cost-ledger options: open the menu (number format / refresh prices), or set directly. Usage: /token-cost-ledger [auto|comma|dot|refresh]",
 		getArgumentCompletions: (prefix: string) => {
 			const trailingSpace = /\s$/.test(prefix);
 			const tokens = prefix.trim().split(/\s+/).filter(Boolean);
@@ -721,7 +946,7 @@ export default function (pi: ExtensionAPI) {
 				(tokens.length === 1 && tokens[0] === "set") ||
 				(tokens.length >= 2 && tokens[0] === "set");
 			if (setComplete || tokens.length <= 1) {
-				const hits = (setComplete ? NUMBER_STYLES : (["set", ...NUMBER_STYLES] as const)).filter((v) =>
+				const hits = (setComplete ? NUMBER_STYLES : (["set", "refresh", ...NUMBER_STYLES] as const)).filter((v) =>
 					v.startsWith(partial),
 				);
 				return hits.length ? hits.map((v) => ({ value: v, label: v })) : null;
@@ -730,31 +955,150 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			const trimmed = (args ?? "").trim().toLowerCase();
-			// Bare / status → show the panel.
-			if (trimmed === "" || trimmed === "status") {
+
+			// `/token-cost-ledger refresh` — pull live costs from models.dev into the
+			// override. Network call; no reload needed (loadPrices re-reads per
+			// query). Handled before the direct-set path so "refresh" isn't mistaken
+			// for a number-style value.
+			if (trimmed === "refresh") {
+				const { primary } = loadRoots();
+				ctx.ui.notify("Refreshing prices from models.dev...", "info");
+				const res = await refreshPrices(primary);
+				if (!res.ok) {
+					ctx.ui.notify(`Failed to refresh prices: ${res.error}`, "error");
+				} else {
+					ctx.ui.notify(formatRefreshResult(res), "info");
+				}
+				return;
+			}
+
+			// Direct set: `/token-cost-ledger <value>` or `/token-cost-ledger set <value>`.
+			// One-shot persist via `pi config set` then reload — shorthand for users
+			// who know what they want. Bare `set` (no value) falls through to menu.
+			if (trimmed !== "" && trimmed !== "status" && trimmed !== "set") {
+				const tokens = trimmed.split(/\s+/).filter(Boolean);
+				const value = (tokens[0] === "set" ? tokens[1] : tokens[0]) as NumberStyleName | undefined;
+				if (!value || !NUMBER_STYLES.includes(value)) {
+					ctx.ui.notify(
+						`Unknown value "${value ?? ""}". Valid: ${NUMBER_STYLES.join(", ")}.`,
+						"warning",
+					);
+					return;
+				}
+				const result = await pi.exec("pi", ["config", "set", "token-cost-ledger-numbers", value]);
+				if (result.code !== 0) {
+					ctx.ui.notify(
+						`Failed to set token-cost-ledger-numbers: ${result.stderr.trim() || `exit ${result.code}`}`,
+						"error",
+					);
+					return;
+				}
+				ctx.ui.notify(`token-cost-ledger-numbers: ${flagNumberStyle()} → ${value}. Reloading...`, "info");
+				warnIfEnvMasked(ctx);
+				await ctx.reload();
+				return;
+			}
+
+			// Menu mode. Outside TUI (RPC/headless), fall back to the read-only
+			// status panel — custom components are terminal-only.
+			if (ctx.mode !== "tui") {
 				ctx.ui.notify(renderStatusPanel(), "info");
 				return;
 			}
-			// `/token-cost-ledger set <value>` or shorthand `/token-cost-ledger <value>`.
-			const tokens = trimmed.split(/\s+/).filter(Boolean);
-			const value = tokens[0] === "set" ? tokens[1] : tokens[0];
-			if (!value || !NUMBER_STYLES.includes(value as NumberStyleName)) {
-				ctx.ui.notify(
-					`Unknown value "${value ?? ""}". Valid: ${NUMBER_STYLES.join(", ")}.`,
-					"warning",
+
+			const effective = numberStyleSetting(pi);
+			const flagVal = flagNumberStyle();
+			const { masked, envOverride } = envOverrideState();
+
+			const { primary } = loadRoots();
+			const pending = new Map<string, string>();
+			const items: SettingItem[] = [
+				{
+					id: "token-cost-ledger-numbers",
+					label: "Number format",
+					description: "Thousands/decimal separators for /token-usage reports. Enter/Space cycles.",
+					currentValue: flagVal,
+					values: [...NUMBER_STYLES],
+				},
+				{
+					// Refresh is an ACTION, not a setting. SettingsList has no "fire on
+					// Enter" affordance beyond cycling values, so it's modeled as a
+					// no/yes toggle: cycle to "yes" → staged, applied on close. Net-zero
+					// (cycled back to "no") drops it, matching the number-format row's
+					// back-out semantics. `/token-cost-ledger refresh` is the no-menu
+					// keyword shortcut.
+					id: "refresh-prices",
+					label: "Refresh prices now",
+					description: `Pull latest costs from models.dev. Last: ${refreshLabel(primary)}.`,
+					currentValue: "no",
+					values: ["no", "yes"],
+				},
+			];
+
+			const header = masked
+				? `pi-token-cost-ledger — options  (env TOKEN_COST_LEDGER_NUMBERS=${envOverride} is overriding the flag; effective=${effective})`
+				: `pi-token-cost-ledger — options  (effective=${effective})`;
+
+			await ctx.ui.custom((tui, theme, _kb, done) => {
+				const container = new Container();
+				container.addChild(new Text(theme.fg("accent", theme.bold(header)), 1, 1));
+
+				const settingsList = new SettingsList(
+					items,
+					Math.min(items.length + 2, 15),
+					getSettingsListTheme(),
+					(id, newValue) => {
+						// Stage the change; persist + reload on close, not here.
+						// (SettingsList already refreshed its own display before
+						// calling us — activateItem mutates item.currentValue.)
+						pending.set(id, newValue);
+					},
+					() => done(undefined),
 				);
-				return;
+				container.addChild(settingsList);
+
+				return {
+					render: (w: number) => container.render(w),
+					invalidate: () => container.invalidate(),
+					handleInput: (data: string) => {
+						settingsList.handleInput(data);
+						tui.requestRender();
+					},
+				};
+			});
+
+			// Dialog closed. ctx is still valid here (reload is the only staleness
+			// trigger, and we haven't called it yet).
+			//
+			// Two independent intents may be staged: a number-format change (needs
+			// `pi config set` + reload) and a refresh (writes prices.json, no reload).
+			// Run refresh first so its notify lands before any reload; apply the
+			// flag change last because reload ends this ctx.
+			const refreshWanted = pending.get("refresh-prices") === "yes";
+			const numValue = pending.get("token-cost-ledger-numbers");
+			const numChanged = numValue !== undefined && numValue !== flagNumberStyle();
+
+			if (refreshWanted) {
+				const res = await refreshPrices(primary);
+				if (!res.ok) {
+					ctx.ui.notify(`Failed to refresh prices: ${res.error}`, "error");
+				} else {
+					ctx.ui.notify(formatRefreshResult(res), "info");
+				}
 			}
-			const current = numberStyleSetting(pi);
-			const result = await pi.exec("pi", ["config", "set", "token-cost-ledger-numbers", value]);
-			if (result.code !== 0) {
+
+			if (!numChanged) return;
+
+			const r = await pi.exec("pi", ["config", "set", "token-cost-ledger-numbers", numValue]);
+			if (r.code !== 0) {
 				ctx.ui.notify(
-					`Failed to set token-cost-ledger-numbers: ${result.stderr.trim() || `exit ${result.code}`}`,
+					`Failed to apply: token-cost-ledger-numbers (${r.stderr.trim() || `exit ${r.code}`})`,
 					"error",
 				);
 				return;
 			}
-			ctx.ui.notify(`token-cost-ledger-numbers: ${current} → ${value}. Reloading...`, "info");
+			ctx.ui.notify(`token-cost-ledger-numbers: ${flagVal} → ${numValue}. Reloading...`, "info");
+			warnIfEnvMasked(ctx);
 			await ctx.reload();
 		},
 	});
@@ -806,42 +1150,100 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// ── QUERY: /usage [today|day|week|month|year|all|model <name>] ──────────
-	pi.registerCommand("usage", {
+	// ── QUERY: /token-usage — quick-range menu (bare, TUI) or typed period ─
+	// Bare command in TUI opens a SelectList picker; `<period>` skips the menu.
+	// Both paths funnel through runQuery, so each menu item's value IS the
+	// typed equivalent — the menu doubles as documentation of what to type.
+	const QUICK_RANGES: readonly SelectItem[] = [
+		{ value: "today", label: "Today", description: "Today only" },
+		{ value: "days 7", label: "Last 7 days", description: "Rolling week incl. today" },
+		{ value: "month", label: "This month", description: "Current calendar month" },
+		{ value: "days 30", label: "Last 30 days", description: "Rolling 30 days incl. today" },
+		{ value: "year", label: "This year", description: "Current calendar year" },
+		{ value: "days 365", label: "Last 365 days", description: "Rolling year incl. today" },
+		{ value: "all", label: "All history", description: "Everything in the ledger" },
+	];
+	const RANGE_LAYOUT = { minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 24 };
+
+	// Shared query runner — menu (on select) and typed path both call this.
+	// Loads roots/prices/formatter fresh per call (cheap; matches the old
+	// inline behavior).
+	const runQuery = async (ctx: ExtensionCommandContext, argString: string): Promise<void> => {
+		const { roots, primary } = loadRoots();
+		const prices = loadPrices(primary);
+		const idx = buildPriceIndex(prices);
+		const conv = cacheConv();
+		const fmt = makeFormatter(resolveStyle(numberStyleSetting(pi)));
+
+		const a = (argString ?? "").trim();
+		const parts = a.split(/\s+/).filter(Boolean);
+
+		// model <name> — special path: scan all history for one model.
+		if (parts[0] === "model" && parts[1]) {
+			const all = await readAllRecords(roots);
+			ctx.ui.notify(renderModel(ctx.ui.theme, parts.slice(1).join(" "), all, idx, conv, fmt), "info");
+			return;
+		}
+
+		const range = parseRange(a);
+		if (!range) {
+			ctx.ui.notify(
+				`Usage: /token-usage [today | day [YYYY-MM-DD] | week [N] | days [N] | month [YYYY-MM] | year [YYYY] | all | model <name>]\nconv: ${conv}`,
+				"warning",
+			);
+			return;
+		}
+
+		const dates = dateRange(range.start, range.end);
+		// `all` walks the ledger directory instead of materializing a multi-year
+		// date range. The sentinel start/end is ignored.
+		const records = parts[0] === "all" ? await readAllRecords(roots) : await readRecords(roots, dates);
+		const agg = aggregate(records, idx, conv, range.subtotalKey);
+		ctx.ui.notify(renderTable(ctx.ui.theme, range, agg, conv, fmt), "info");
+	};
+
+	pi.registerCommand("token-usage", {
 		description:
-			"Token & cost usage. /usage [today|day [YYYY-MM-DD]|week [N]|month [YYYY-MM]|year [YYYY]|all|model <name>]. Shows real USD and api-equiv USD.",
+			"Token & cost usage. /token-usage (opens range menu) | /token-usage <today|day|week|days|month|year|all|model>. Shows real USD and api-equiv USD.",
 		handler: async (args, ctx) => {
-			const { roots, primary } = loadRoots();
-			const prices = loadPrices(primary);
-			const idx = buildPriceIndex(prices);
-			const conv = cacheConv();
-			const fmt = makeFormatter(resolveStyle(numberStyleSetting(pi)));
-
 			const a = (args ?? "").trim();
-			const parts = a.split(/\s+/).filter(Boolean);
-
-			// model <name> — special path: scan all history for one model.
-			if (parts[0] === "model" && parts[1]) {
-				const all = await readAllRecords(roots);
-				ctx.ui.notify(renderModel(ctx.ui.theme, parts.slice(1).join(" "), all, idx, conv, fmt), "info");
+			// Bare command in TUI → quick-range menu. Non-TUI (RPC/headless) and
+			// any explicit args skip the menu and go straight to runQuery; bare
+			// non-TUI falls through to parseRange's today default (old behavior).
+			if (a === "" && ctx.mode === "tui") {
+				let chosen: string | null = null;
+				await ctx.ui.custom((tui, theme, _kb, done) => {
+					const container = new Container();
+					container.addChild(
+						new Text(theme.fg("accent", theme.bold("Token usage — select a range")), 1, 1),
+					);
+					const selectList = new SelectList(
+						[...QUICK_RANGES],
+						QUICK_RANGES.length,
+						getSelectListTheme(),
+						RANGE_LAYOUT,
+					);
+					selectList.onSelect = (item) => {
+						chosen = item.value;
+						done(undefined);
+					};
+					selectList.onCancel = () => done(undefined);
+					container.addChild(selectList);
+					return {
+						render: (w: number) => container.render(w),
+						invalidate: () => container.invalidate(),
+						handleInput: (data: string) => {
+							selectList.handleInput(data);
+							tui.requestRender();
+						},
+					};
+				});
+				// Dialog closed. ctx still valid (no reload happened). Run the
+				// chosen range; Esc/cancel → chosen stays null, no-op.
+				if (chosen) await runQuery(ctx, chosen);
 				return;
 			}
-
-			const range = parseRange(a);
-			if (!range) {
-				ctx.ui.notify(
-					`Usage: /usage [today | day [YYYY-MM-DD] | week [N] | month [YYYY-MM] | year [YYYY] | all | model <name>]\nconv: ${conv}`,
-					"warning",
-				);
-				return;
-			}
-
-			const dates = dateRange(range.start, range.end);
-			// `all` walks the ledger directory instead of materializing a multi-year
-			// date range. The sentinel start/end is ignored.
-			const records = parts[0] === "all" ? await readAllRecords(roots) : await readRecords(roots, dates);
-			const agg = aggregate(records, idx, conv, range.subtotalKey);
-			ctx.ui.notify(renderTable(ctx.ui.theme, range, agg, conv, fmt), "info");
+			await runQuery(ctx, a);
 		},
 	});
 }
