@@ -21,7 +21,15 @@
     "type": "git",
     "url": "git+https://github.com/EstebanForge/pi-token-cost-ledger.git"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
   "files": [
     "extensions",
     "README.md",
@@ -33,7 +41,8 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
@@ -42,6 +51,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.7",
+    "@earendil-works/pi-coding-agent": "*"
   }
 }
