@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0 — 2026-08-03
+
+### Added
+- **Usage charts.** `/token-usage chart [period]` renders a usage dashboard as
+  a self-contained **SVG** (dark theme, KPI row + per-model multi-line chart +
+  a second unified single-line chart summing all models) to
+  `<ledger>/charts/usage-<start>_<end>.svg`. A **PNG** is emitted alongside
+  when `rsvg-convert` or `inkscape` is on PATH — zero npm dependencies either
+  way. Default window is the last 30 days; any period the text command accepts
+  works (`today`, `days N`, `week`, `month`, `year`, `all`). Adapts the
+  single-vendor dashboard convention to pi's multi-provider reality: the KPI
+  row shows **Total / top model / top provider**, and the per-model legend
+  reads `provider:model`.
+
 ## 1.1.1 — 2026-07-21
 
 ### Fixed

@@ -24,6 +24,7 @@ pi install npm:@estebanforge/pi-token-cost-ledger
 /token-usage year [YYYY]           current year, or a specific one
 /token-usage all                   full history
 /token-usage model <name>          one model across all history, by month
+/token-usage chart [period]        render a usage dashboard (SVG + optional PNG)
 ```
 
 Run `/token-usage` with no argument (in the TUI) to pick a range from a menu:
@@ -34,6 +35,74 @@ Each report prints:
 - **Total** — real $ · api-equiv $ · total tokens · calls
 - **By model** — per-model breakdown
 - **By period** — day or month subtotals (when the range spans more than one)
+
+## Charts
+
+`/token-usage chart [period]` renders a usage dashboard as a self-contained
+**SVG** to `~/.pi/extensions-data/estebanforge/pi-token-cost-ledger/charts/usage-<start>_<end>.svg`,
+then prints the path. A **PNG** is written alongside when `rsvg-convert` or
+`inkscape` is on PATH — **no npm dependencies are added either way** (SVG is
+pure string templating; PNG relies on a system binary you may already have).
+
+```
+/token-usage chart              last 30 days (default)
+/token-usage chart today
+/token-usage chart days 7
+/token-usage chart month
+/token-usage chart all
+```
+
+The dashboard adapts the single-vendor "usage details" convention to pi's
+multi-provider reality:
+
+- **KPI row** — Total token consumption · top **model** consumption · top
+  **provider** consumption (so the cross-provider split is visible at a glance).
+- **By model** — one line per model, colored by usage rank; legend reads
+  `provider:model`. The busiest model always takes the amber line.
+- **Total (all models combined)** — a second chart with a single filled line
+  summing every model, for the overall trend.
+
+The period accepts anything the text command does (`today`, `day [D]`,
+`week [N]`, `days [N]`, `month [YYYY-MM]`, `year [YYYY]`, `all`). SVG needs
+nothing; PNG is emitted only when a converter is found on `PATH`. These are
+**optional system dependencies** — the extension adds no npm packages for
+rendering.
+
+**Linux** (Debian / Ubuntu):
+
+```
+sudo apt install librsvg2-bin      # rsvg-convert — fastest, headless-native
+# or
+sudo apt install inkscape
+```
+
+Fedora / RHEL:
+
+```
+sudo dnf install librsvg2          # provides rsvg-convert
+# or
+sudo dnf install inkscape
+```
+
+Arch:
+
+```
+sudo pacman -S librsvg             # provides rsvg-convert
+# or
+sudo pacman -S inkscape
+```
+
+**macOS** (Homebrew):
+
+```
+brew install librsvg               # provides rsvg-convert (recommended)
+# or
+brew install --cask inkscape
+```
+
+`rsvg-convert` (from `librsvg`) is preferred — small, fast, and built for
+headless conversion. `inkscape` works but is heavier. If neither is present,
+the SVG is still written and the notify notes how to enable PNG.
 
 ## How it works
 
@@ -54,6 +123,7 @@ Each report prints:
 | --- | --- |
 | `/token-usage` | Open the range menu (Today / Last 7-30-365 days / This month / This year / All). |
 | `/token-usage <period>` | Query usage directly (today/day/week/days/month/year/all/model). See Usage above. |
+| `/token-usage chart [period]` | Render a usage dashboard (SVG + optional PNG) to `<ledger>/charts/`. Default: last 30 days. |
 | `/token-cost-ledger refresh` | Pull latest costs from models.dev into the override (network). |
 | `/token-cost-ledger` | Open the interactive options menu (number format / refresh prices). |
 | `/token-cost-ledger <auto\|comma\|dot>` | Set number format directly (one-shot shorthand; persists + reloads). |

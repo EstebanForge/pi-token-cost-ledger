@@ -45,6 +45,7 @@ import { Container, SelectList, SettingsList, Text, type SelectItem, type Settin
 import { appendFile, mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -875,6 +876,334 @@ function renderModel(theme: Theme, modelName: string, records: CostRecord[], idx
 	return lines.join("\n");
 }
 
+// ── Chart generation (SVG dashboard, optional PNG via system converter) ─────
+//
+// /token-usage chart [period] renders a Z.ai-style usage dashboard as a
+// self-contained SVG: KPI row + per-model multi-line chart + a second
+// unified single-line chart (all models summed). Zero npm deps — SVG is pure
+// string templating. PNG is emitted too when rsvg-convert or inkscape is on
+// PATH (best-effort; no native binary ships with the package). Matches the
+// no-cruft / no-new-dep philosophy.
+
+// Distinct, dark-theme-friendly series colors. Assigned by usage rank so the
+// busiest model always lands on the amber (matching the reference's dominant
+// line). Cycle wraps for >10 models (rare; long tail falls into legend "+N").
+const SERIES_COLORS = [
+	"#F59E0B", // amber
+	"#A855F7", // purple
+	"#3B82F6", // blue
+	"#22C55E", // green
+	"#EC4899", // pink
+	"#06B6D4", // cyan
+	"#EAB308", // yellow
+	"#EF4444", // red
+	"#14B8A6", // teal
+	"#8B5CF6", // violet
+];
+
+interface ChartSeries {
+	name: string;
+	color: string;
+	values: number[]; // one value per day, aligned to `dates`
+	fill?: boolean; // fill area under the line (used for the unified total)
+}
+
+interface ChartData {
+	dates: string[]; // sorted day keys (the X axis)
+	models: string[]; // sorted by total tokens desc
+	modelColor: Map<string, string>;
+	modelProvider: Map<string, string>; // dominant provider per model (for legend)
+	modelTotal: Map<string, number>;
+	matrix: Map<string, number[]>; // model -> tokens per day
+	totalPerDay: number[]; // all models summed per day (unified chart)
+	grandTotal: number;
+	providerTotal: Map<string, number>;
+	spanStart: Date;
+	spanEnd: Date;
+}
+
+/** Sum all token buckets of a record (matches renderTable's tokTotal). Coerces
+ *  non-numeric fields to 0 — a corrupt/legacy line with string token values
+ *  would otherwise concatenate into the matrix and surface as NaN SVG coords. */
+function recTokens(r: CostRecord): number {
+	const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+	return num(r.tokens.input) + num(r.tokens.output) + num(r.tokens.cacheRead) + num(r.tokens.cacheWrite);
+}
+
+/**
+ * Build per-day-per-model series from records.
+ * `dateList` non-null → ranged query: X axis = every day in the range (zeros
+ * included, so the line is continuous like the reference). `dateList` null →
+ * `all` query: X axis = only the days that have records (sparse by intent).
+ */
+function buildChartData(records: CostRecord[], dateList: Date[] | null): ChartData {
+	let dates: string[];
+	let spanStart: Date;
+	let spanEnd: Date;
+	if (dateList) {
+		dates = dateList.map(dayKey);
+		spanStart = dateList[0];
+		spanEnd = dateList[dateList.length - 1];
+	} else {
+		const set = new Set<string>();
+		let min = Number.POSITIVE_INFINITY;
+		let max = Number.NEGATIVE_INFINITY;
+		for (const r of records) {
+			set.add(dayKey(new Date(r.ts)));
+			if (r.ts < min) min = r.ts;
+			if (r.ts > max) max = r.ts;
+		}
+		dates = [...set].sort();
+		spanStart = new Date(min === Number.POSITIVE_INFINITY ? Date.now() : min);
+		spanEnd = new Date(max === Number.NEGATIVE_INFINITY ? Date.now() : max);
+	}
+	const idx = new Map<string, number>();
+	dates.forEach((d, i) => idx.set(d, i));
+
+	const matrix = new Map<string, number[]>();
+	const modelTotal = new Map<string, number>();
+	const providerTotal = new Map<string, number>();
+	const providerCounts = new Map<string, Map<string, number>>(); // model -> provider -> call count
+	const totalPerDay = new Array<number>(dates.length).fill(0);
+	let grandTotal = 0;
+
+	for (const r of records) {
+		const i = idx.get(dayKey(new Date(r.ts)));
+		if (i === undefined) continue; // outside range (clock skew / `all` recompute) — skip
+		const m = r.model ?? "unknown";
+		const p = r.provider ?? "unknown";
+		const t = recTokens(r);
+		if (!matrix.has(m)) {
+			matrix.set(m, new Array(dates.length).fill(0));
+			modelTotal.set(m, 0);
+			providerCounts.set(m, new Map());
+		}
+		matrix.get(m)![i] += t;
+		modelTotal.set(m, modelTotal.get(m)! + t);
+		providerTotal.set(p, (providerTotal.get(p) ?? 0) + t);
+		providerCounts.get(m)!.set(p, (providerCounts.get(m)!.get(p) ?? 0) + 1);
+		totalPerDay[i] += t;
+		grandTotal += t;
+	}
+
+	const models = [...matrix.keys()].sort((a, b) => modelTotal.get(b)! - modelTotal.get(a)!);
+	const modelColor = new Map<string, string>();
+	models.forEach((m, i) => modelColor.set(m, SERIES_COLORS[i % SERIES_COLORS.length]));
+	// A model can surface under multiple provider strings (e.g. MiniMax-M3 via
+	// "minimax" and a clean-room "minimax-m3-clean"). Legend shows the DOMINANT
+	// one so the label stays stable and honest.
+	const modelProvider = new Map<string, string>();
+	for (const m of models) {
+		let best = "";
+		let bestN = -1;
+		for (const [p, c] of providerCounts.get(m)!) if (c > bestN) (bestN = c), (best = p);
+		modelProvider.set(m, best);
+	}
+
+	return { dates, models, modelColor, modelProvider, modelTotal, matrix, totalPerDay, grandTotal, providerTotal, spanStart, spanEnd };
+}
+
+/** Round a max value up to a 1/2/5 × 10^n nice number for clean axis ticks. */
+function niceMax(v: number): number {
+	if (v <= 0) return 1;
+	const pow = Math.pow(10, Math.floor(Math.log10(v)));
+	const n = v / pow;
+	const nice = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+	return nice * pow;
+}
+
+/** Compact token count for axis labels (no locale — M/K/B is conventional). */
+function compactAxis(n: number): string {
+	const trim = (x: number) => String(Math.round(x * 10) / 10);
+	if (n >= 1e9) return trim(n / 1e9) + "B";
+	if (n >= 1e6) return trim(n / 1e6) + "M";
+	if (n >= 1e3) return trim(n / 1e3) + "K";
+	return String(Math.round(n));
+}
+
+function xmlEscape(s: string): string {
+	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** Draw one line chart (title + optional legend + grid + axes + series). Returns SVG fragment. */
+function lineChartFragment(box: { x: number; y: number; w: number; h: number }, title: string, series: ChartSeries[], dates: string[], single: boolean): string {
+	const { x, y, w, h } = box;
+	const plotL = x + 64;
+	const plotR = x + w - 28;
+	const plotW = plotR - plotL;
+	const titleY = y + 18;
+	const legendY = y + 40;
+	const plotTop = single ? y + 34 : y + 56;
+	const plotBottom = y + h - 26;
+	const plotH = plotBottom - plotTop;
+	const n = dates.length;
+	const out: string[] = [];
+
+	out.push(`<text x="${x}" y="${titleY}" fill="#FFFFFF" font-size="15" font-weight="700">${xmlEscape(title)}</text>`);
+
+	// Legend: single wrapped row, ellipsized with "+N more" when it overflows.
+	// Approx char width 6.4 keeps it simple; SVG text metrics aren't available
+	// without a layout pass, which would need a dep.
+	if (!single) {
+		let lx = x;
+		for (let i = 0; i < series.length; i++) {
+			const s = series[i];
+			const itemW = s.name.length * 6.4 + 22;
+			if (lx + itemW > x + w) {
+				out.push(`<text x="${lx.toFixed(0)}" y="${legendY}" fill="#8E8E8E" font-size=\"11\">+${series.length - i} more</text>`);
+				break;
+			}
+			out.push(`<circle cx="${(lx + 5).toFixed(0)}" cy="${legendY - 4}" r="4" fill="${s.color}"/>`);
+			out.push(`<text x="${(lx + 14).toFixed(0)}" y="${legendY}" fill="#B3B3B3" font-size="11">${xmlEscape(s.name)}</text>`);
+			lx += itemW;
+		}
+	}
+
+	// yMax across all series, snapped to a nice number for clean ticks.
+	let yMaxRaw = 0;
+	for (const s of series) for (const v of s.values) if (v > yMaxRaw) yMaxRaw = v;
+	const yMax = niceMax(yMaxRaw);
+	const ticks = 5;
+
+	for (let t = 0; t <= ticks; t++) {
+		const val = (yMax * t) / ticks;
+		const gy = plotBottom - (val / yMax) * plotH;
+		out.push(`<line x1="${plotL}" y1="${gy.toFixed(1)}" x2="${plotR}" y2="${gy.toFixed(1)}" stroke="#3A3A40" stroke-width="1"/>`);
+		out.push(`<text x="${plotL - 8}" y="${(gy + 3).toFixed(1)}" fill="#8E8E8E" font-size="10" text-anchor="end">${compactAxis(val)}</text>`);
+	}
+
+	// X labels thinned to ~8 across, anchored to actual date positions.
+	if (n > 0) {
+		const step = Math.max(1, Math.ceil(n / 8));
+		for (let i = 0; i < n; i += step) {
+			const px = n > 1 ? plotL + (i * plotW) / (n - 1) : plotL + plotW / 2;
+			out.push(`<text x="${px.toFixed(0)}" y="${plotBottom + 16}" fill="#8E8E8E" font-size="10" text-anchor="middle">${dates[i]}</text>`);
+		}
+	}
+
+	const sx = (i: number) => (n > 1 ? plotL + (i * plotW) / (n - 1) : plotL + plotW / 2);
+	const sy = (v: number) => plotBottom - (v / yMax) * plotH;
+	for (const s of series) {
+		if (n === 1) {
+			// Single-day window: a point, not a line.
+			out.push(`<circle cx="${sx(0).toFixed(1)}" cy="${sy(s.values[0] ?? 0).toFixed(1)}" r="3" fill="${s.color}"/>`);
+			continue;
+		}
+		const pts = s.values.map((v, i) => `${sx(i).toFixed(1)},${sy(v).toFixed(1)}`).join(" ");
+		if (s.fill) {
+			const area = `${sx(0).toFixed(1)},${plotBottom.toFixed(1)} ${pts} ${sx(n - 1).toFixed(1)},${plotBottom.toFixed(1)}`;
+			out.push(`<polygon points="${area}" fill="url(#areaGrad)"/>`);
+		}
+		out.push(`<polyline points="${pts}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`);
+	}
+	return out.join("\n");
+}
+
+/** Assemble the full dashboard SVG document. */
+function buildUsageSVG(range: Range, data: ChartData, fmt: Formatter): string {
+	const W = 1240;
+	const H = 760;
+	const parts: string[] = [];
+	parts.push(`<?xml version="1.0" encoding="UTF-8"?>`);
+	parts.push(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">`,
+	);
+	parts.push(
+		`<defs><linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3B82F6" stop-opacity="0.28"/><stop offset="1" stop-color="#3B82F6" stop-opacity="0"/></linearGradient></defs>`,
+	);
+	parts.push(`<rect width="${W}" height="${H}" fill="#202022"/>`);
+
+	// Header + subtitle (cache convention + generation timestamp).
+	parts.push(`<text x="32" y="40" fill="#FFFFFF" font-size="22" font-weight="700">Token usage — ${xmlEscape(range.label)}</text>`);
+	const gen = new Date().toISOString().slice(0, 16).replace("T", " ");
+	parts.push(`<text x="32" y="60" fill="#8E8E8E" font-size="11">cache convention: ${cacheConv()} · generated ${gen}</text>`);
+
+	if (data.grandTotal === 0 || data.models.length === 0) {
+		parts.push(`<text x="${W / 2}" y="${H / 2}" fill="#8E8E8E" font-size="14" text-anchor="middle">No usage recorded for this period.</text>`);
+		parts.push(`</svg>`);
+		return parts.join("\n");
+	}
+
+	// KPI row: total / top model / 2nd model. The provider axis was dropped
+	// because the top provider is almost always the top model's owner (zai owns
+	// glm-5.2), so a "top provider" box just duplicated the top model's number.
+	// The 2nd model adds real signal. Falls back to top provider only when there
+	// is a single model (degenerate: nothing else to show).
+	const topModel = data.models[0];
+	const topModelTotal = data.modelTotal.get(topModel)!;
+	const cellW = (W - 64) / 3;
+	const kpi = (i: number, color: string, label: string, value: string): string => {
+		const cx = 32 + i * cellW;
+		const f: string[] = [];
+		if (i > 0) f.push(`<line x1="${32 + i * cellW}" y1="80" x2="${32 + i * cellW}" y2="138" stroke="#3A3A40" stroke-width="1"/>`);
+		f.push(`<circle cx="${cx + 14}" cy="104" r="5" fill="${color}"/>`);
+		f.push(`<text x="${cx + 28}" y="100" fill="#8E8E8E" font-size="11">${xmlEscape(label)}</text>`);
+		f.push(`<text x="${cx + 28}" y="126" fill="#FFFFFF" font-size="24" font-weight="700">${xmlEscape(value)}</text>`);
+		return f.join("\n");
+	};
+	parts.push(`<line x1="32" y1="74" x2="${W - 32}" y2="74" stroke="#2E2E33" stroke-width="1"/>`);
+	parts.push(kpi(0, "#3B82F6", "Total Token Consumption", fmt.tok(data.grandTotal)));
+	parts.push(kpi(1, data.modelColor.get(topModel)!, `${topModel} Consumption`, fmt.tok(topModelTotal)));
+	if (data.models.length >= 2) {
+		const second = data.models[1];
+		parts.push(kpi(2, data.modelColor.get(second)!, `${second} Consumption`, fmt.tok(data.modelTotal.get(second)!)));
+	} else {
+		// Single-model ledger: no 2nd model, so surface the provider dimension.
+		let topProvider = "";
+		let topProviderTotal = 0;
+		for (const [p, t] of data.providerTotal) if (t > topProviderTotal) ((topProviderTotal = t), (topProvider = p));
+		parts.push(kpi(2, "#A855F7", `${topProvider} Consumption`, fmt.tok(topProviderTotal)));
+	}
+	parts.push(`<line x1="32" y1="142" x2="${W - 32}" y2="142" stroke="#2E2E33" stroke-width="1"/>`);
+
+	// Chart A: per-model multi-line (the reference layout).
+	const seriesA: ChartSeries[] = data.models.map((m) => ({
+		name: `${data.modelProvider.get(m)}:${m}`,
+		color: data.modelColor.get(m)!,
+		values: data.matrix.get(m)!,
+	}));
+	parts.push(lineChartFragment({ x: 24, y: 152, w: W - 48, h: 268 }, "By model", seriesA, data.dates, false));
+
+	// Chart B: unified total across ALL models (single line + area fill).
+	const seriesB: ChartSeries[] = [{ name: "Total", color: "#3B82F6", values: data.totalPerDay, fill: true }];
+	parts.push(lineChartFragment({ x: 24, y: 436, w: W - 48, h: 300 }, "Total (all models combined)", seriesB, data.dates, true));
+
+	parts.push(`</svg>`);
+	return parts.join("\n");
+}
+
+/** Detect a system SVG→PNG converter on PATH. None → SVG-only output. */
+function detectPngConverter(): { bin: string; kind: "rsvg" | "inkscape" } | null {
+	for (const [bin, kind] of [
+		["rsvg-convert", "rsvg"],
+		["inkscape", "inkscape"],
+	] as const) {
+		// --version with a hard timeout: spawnSync blocks the Node event loop, so a
+		// hung or slow binary (inkscape GUI boot, unreachable DISPLAY) must never
+		// freeze the whole pi process. status!=0 (incl. timeout SIGTERM) → skip.
+		const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 5000 });
+		if (r.status === 0) return { bin, kind };
+	}
+	return null;
+}
+
+/** Run the detected converter. rsvg-convert is fastest and headless-native.
+ *  inkscape flags below are 1.0+ syntax (--export-type/--export-filename);
+ *  pre-1.0 inkscape (-e/--export-png) will fail and the error is surfaced. */
+function renderPng(conv: { bin: string; kind: "rsvg" | "inkscape" }, svgPath: string, pngPath: string, width: number): { ok: boolean; error?: string } {
+	const args =
+		conv.kind === "rsvg"
+			? ["-w", String(width), svgPath, "-o", pngPath]
+			: [svgPath, "--export-type=png", `--export-filename=${pngPath}`, "-w", String(width)];
+	// 30s cap: a small SVG rasterizes in well under a second; anything longer is
+	// a hang. Blocks the event loop, so the timeout is mandatory, not optional.
+	const r = spawnSync(conv.bin, args, { encoding: "utf8", timeout: 30_000 });
+	if (r.status === 0) return { ok: true };
+	if (r.error) return { ok: false, error: r.error.message };
+	if (r.signal) return { ok: false, error: `killed by ${r.signal} (timeout?)` };
+	return { ok: false, error: `exit ${r.status}` };
+}
+
 // ── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -1193,6 +1522,53 @@ export default function (pi: ExtensionAPI) {
 	];
 	const RANGE_LAYOUT = { minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 24 };
 
+	// CHART: /token-usage chart [period] — renders an SVG dashboard (per-model
+	// multi-line + unified single-line total) to <primary>/charts/. PNG emitted
+	// too when a system converter (rsvg-convert / inkscape) is on PATH; no npm
+	// dependency either way. Default window = last 30 days.
+	const runChart = async (ctx: ExtensionCommandContext, argString: string): Promise<void> => {
+		const { roots, primary } = loadRoots();
+		const fmt = makeFormatter(resolveStyle(numberStyleSetting(pi)));
+		const a = (argString ?? "").trim();
+		const isAll = a.split(/\s+/)[0] === "all";
+		const range = parseRange(a === "" ? "days 30" : a);
+		if (!range) {
+			ctx.ui.notify(
+				"Usage: /token-usage chart [today | day [YYYY-MM-DD] | week [N] | days [N] | month [YYYY-MM] | year [YYYY] | all]",
+				"warning",
+			);
+			return;
+		}
+		const dateList = isAll ? null : dateRange(range.start, range.end);
+		const records = isAll ? await readAllRecords(roots) : await readRecords(roots, dateRange(range.start, range.end));
+		const data = buildChartData(records, dateList);
+		const svg = buildUsageSVG(range, data, fmt);
+
+		const dir = join(primary, "charts");
+		await mkdir(dir, { recursive: true });
+		const stem = `usage-${dayKey(data.spanStart)}_${dayKey(data.spanEnd)}`;
+		const svgPath = join(dir, `${stem}.svg`);
+		await writeFile(svgPath, svg, "utf8");
+
+		const conv = detectPngConverter();
+		let pngPath: string | null = null;
+		let pngErr: string | null = null;
+		if (conv) {
+			const p = join(dir, `${stem}.png`);
+			const r = renderPng(conv, svgPath, p, 1600);
+			if (r.ok) pngPath = p;
+			else pngErr = r.error ?? "unknown error";
+		}
+
+		// Three distinct outcomes, each with its own message — a converter present
+		// but failing must NOT silently degrade to an indistinguishable SVG-only.
+		const lines = [`Chart: ${svgPath}`];
+		if (pngPath) lines.push(`PNG : ${pngPath}`);
+		else if (pngErr) lines.push(`PNG failed (${conv!.bin}): ${pngErr}`);
+		else lines.push("(SVG only — install rsvg-convert or inkscape for PNG)");
+		ctx.ui.notify(lines.join("\n"), "info");
+	};
+
 	// Shared query runner — menu (on select) and typed path both call this.
 	// Loads roots/prices/formatter fresh per call (cheap; matches the old
 	// inline behavior).
@@ -1205,6 +1581,13 @@ export default function (pi: ExtensionAPI) {
 
 		const a = (argString ?? "").trim();
 		const parts = a.split(/\s+/).filter(Boolean);
+
+		// chart [period] — render the SVG dashboard (per-model + unified total),
+		// optional PNG when a system converter (rsvg-convert/inkscape) is present.
+		if (parts[0] === "chart") {
+			await runChart(ctx, parts.slice(1).join(" "));
+			return;
+		}
 
 		// model <name> — special path: scan all history for one model.
 		if (parts[0] === "model" && parts[1]) {
@@ -1232,7 +1615,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("token-usage", {
 		description:
-			"Token & cost usage. /token-usage (opens range menu) | /token-usage <today|day|week|days|month|year|all|model>. Shows real USD and api-equiv USD.",
+			"Token & cost usage. /token-usage (opens range menu) | /token-usage <today|day|week|days|month|year|all|model> | /token-usage chart [period] (SVG dashboard + optional PNG). Shows real USD and api-equiv USD.",
 		handler: async (args, ctx) => {
 			const a = (args ?? "").trim();
 			// Bare command in TUI → quick-range menu. Non-TUI (RPC/headless) and
