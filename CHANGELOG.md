@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2 — 2026-08-20
+
+### Fixed
+- **Prices for GLM-5.3 and Claude Opus 5.** Added bundled `prices.json` entries for `glm-5.3` (\$1.40 input / \$0.26 cache-read / \$4.40 output per 1M, per the published Z.ai pricing page) and `claude-opus-5` (\$5 / \$0.50 / \$25, per models.dev). Both models had no entry, so about 7.8K calls (973M tokens) rendered as `$0.00 api-equiv` and tripped the unpriced-model warning. models.dev has not listed GLM-5.3 yet, which is why `/token-cost-ledger refresh` could not close the gap (refresh is update-only by design; new models ship with the bundled file).
+
 ## 1.2.1 — 2026-08-06
 
 ### Changed
