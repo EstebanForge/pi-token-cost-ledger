@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.3 — 2026-08-26
+
+### Added
+- **Prices for GLM-5.3-Flash** (list rates per the Z.ai pricing page:
+  $0.15 input / $0.03 cache-read / $0.50 output per 1M; 50% launch promo
+  through 2026-09-09, list encoded). Same gap class as glm-5.3 in 1.2.2:
+  models.dev lags new Z.ai releases and `/token-cost-ledger refresh` is
+  update-only by design, so the entry ships in the bundled file — and was
+  also hand-added to the live override so flash turns are priced today.
+
+### Fixed
+- **`[1m]` coding-plan route suffixes now price against the base model.**
+  Z.ai's 1M-context routes (`glm-5.3[1m]`, `glm-5.3-flash[1m]`) are distinct
+  model ids in pi, and the ledger records `msg.model` verbatim — so every
+  `[1m]` turn missed the exact-match lookup and reported `$0.00 api-equiv`
+  plus unpriced-model warning noise. `lookupPrice` now strips one trailing
+  bracket group when the exact key misses (exact match always wins first;
+  unknown models still miss). Also corrected the README's stale
+  "case-sensitive keys" claim — the index lowercases both sides.
+
 ## 1.2.2 — 2026-08-20
 
 ### Fixed

@@ -154,7 +154,7 @@ jq -rc '.providers | to_entries[] | .key as $p
   /tmp/models-dev-catalog.json
 ```
 
-Map catalog `{input, output, cache_read}` → this file's `{i, o, c}`. Keys MUST match the ledger's exact model string (case-sensitive — e.g. `MiniMax-M3`, not `minimax-m3`). Models with context-tier pricing use the **default tier** (<200K / <512K context); the over-tier rate is noted in `_tier_note`. After editing, no reload is needed — queries re-read the file each call.
+Map catalog `{input, output, cache_read}` → this file's `{i, o, c}`. Keys match the ledger's model string case-insensitively (both sides are lowercased at lookup). A trailing Z.ai coding-plan route suffix (`[1m]`, as in `glm-5.3-flash[1m]`) is stripped automatically when the exact key misses, so only the base model needs an entry — `[1m]` is a routing variant of the same model at the same price, never a catalog SKU. Models with context-tier pricing use the **default tier** (<200K / <512K context); the over-tier rate is noted in `_tier_note`. After editing, no reload is needed — queries re-read the file each call.
 
 models.dev alternatives: the catalog JSON (`catalog.json` / `models.json` / `providers.json`), the `@opencode-ai/models` npm SDK (typed snapshot for offline use), or TOML sources on GitHub.
 

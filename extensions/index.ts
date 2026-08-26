@@ -97,14 +97,14 @@ interface CostRecord {
 	};
 }
 
-interface PriceTier {
+export interface PriceTier {
 	i: number; // input per 1M
 	c: number; // cache-read per 1M
 	o: number; // output per 1M
 	_tier_note?: string; // optional manual annotation (higher-tier pricing, etc.)
 }
 
-type Prices = Record<string, PriceTier>;
+export type Prices = Record<string, PriceTier>;
 
 /**
  * Case-insensitive price index. Ledger model strings come from whatever the
@@ -117,7 +117,7 @@ interface PriceIndex {
 	byLower: Map<string, PriceTier>;
 }
 
-function buildPriceIndex(prices: Prices): PriceIndex {
+export function buildPriceIndex(prices: Prices): PriceIndex {
 	const byLower = new Map<string, PriceTier>();
 	for (const [k, v] of Object.entries(prices)) {
 		if (k.startsWith("_")) continue; // skip _doc / _refresh / _tier_note meta keys
@@ -126,8 +126,17 @@ function buildPriceIndex(prices: Prices): PriceIndex {
 	return { byLower };
 }
 
-function lookupPrice(model: string, idx: PriceIndex): PriceTier | undefined {
-	return idx.byLower.get((model ?? "").toLowerCase());
+export function lookupPrice(model: string, idx: PriceIndex): PriceTier | undefined {
+	const key = (model ?? "").toLowerCase();
+	const exact = idx.byLower.get(key);
+	if (exact) return exact;
+	// z.ai Coding Plan 1M-context routes append "[1m]" to the model id
+	// (e.g. glm-5.3-flash[1m]): same model, same price — a routing suffix,
+	// not a SKU, and the models.dev catalog never lists it. Ledger records
+	// carry msg.model verbatim, so strip ONE trailing bracket group and
+	// retry. Exact match always wins first; unknown models still miss.
+	const stripped = key.replace(/\[[^\]]*\]$/, "");
+	return stripped !== key ? idx.byLower.get(stripped) : undefined;
 }
 
 interface Bucket {
