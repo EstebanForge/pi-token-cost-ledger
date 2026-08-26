@@ -3,6 +3,7 @@
   "_refresh": "jq -rc '.providers | to_entries[] | .key as $p | select($p|test(\"^(zai|anthropic|minimax|google|openai)$\")) | .value.models // {} | to_entries[] | select(.value.cost != null) | {provider:$p, model:.key, cost:.value.cost, name:.value.name}' ~/tmp/models-dev-catalog.json",
   "_intro_pricing": "claude-sonnet-5 shows intro $2/$10 (through ~Aug 2026); standard $3/$15 applies after. Reflects current published rate.",
 
+  "glm-5.3-flash":  {"i": 0.15, "c": 0.03, "o": 0.5, "_tier_note": "z.ai pricing page 2026-08-26; list rates; 50% launch promo to 2026-09-09"},
   "glm-5.3":         {"i": 1.4,  "c": 0.26,  "o": 4.4},
   "glm-5.2":         {"i": 1.4,  "c": 0.26,  "o": 4.4},
   "glm-5.1":         {"i": 1.4,  "c": 0.26,  "o": 4.4},
